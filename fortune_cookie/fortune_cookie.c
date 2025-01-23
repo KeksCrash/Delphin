@@ -51,6 +51,8 @@ const char* fortune_messages[] = {
     "Alhamdulillah, inshallah jetzt ist alles besser!",
     "Alhamdulillah, inshallah alles geht gut <3! :)",
     "Mach dir keinen Kopf, denn es ist alles gut solange du Gott an deiner Seite hast <3",
+    "Mach dir keinen Kopf, Alles wird gut!",
+    "PS: Lern wirklich früher!!!! Für Papa",
 };
 const uint8_t fortune_count = sizeof(fortune_messages) / sizeof(fortune_messages[0]);
 
