@@ -1,0 +1,988 @@
+diff --git a/applications/system/hid_app/application.fam b/applications/system/hid_app/application.fam
+index f7aff972a6..98d0578aaa 100644
+--- a/applications/system/hid_app/application.fam
++++ b/applications/system/hid_app/application.fam
+@@ -23,7 +23,6 @@ App(
+     stack_size=2 * 1024,
+     sources=["*.c", "!transport_usb.c"],
+     cdefines=["HID_TRANSPORT_BLE"],
+-    fap_libs=["ble_profile"],
+     fap_description="Use Flipper as a HID remote control over Bluetooth",
+     fap_version="1.1",
+     fap_category="Bluetooth",
+diff --git a/applications/system/hid_app/ble_hid.c b/applications/system/hid_app/ble_hid.c
+new file mode 100644
+index 0000000000..2d9cb8a38c
+--- /dev/null
++++ b/applications/system/hid_app/ble_hid.c
+@@ -0,0 +1,416 @@
++#include "ble_hid.h"
++
++#include <furi_hal_usb_hid.h>
++#include <services/dev_info_service.h>
++#include <services/battery_service.h>
++#include "ble_hid_svc.h"
++
++#include <furi.h>
++#include <usb_hid.h>
++#include <ble/ble.h>
++
++#define HID_INFO_BASE_USB_SPECIFICATION (0x0101)
++#define HID_INFO_COUNTRY_CODE (0x00)
++#define BLE_PROFILE_HID_INFO_FLAG_REMOTE_WAKE_MSK (0x01)
++#define BLE_PROFILE_HID_INFO_FLAG_NORMALLY_CONNECTABLE_MSK (0x02)
++
++#define BLE_PROFILE_HID_KB_MAX_KEYS (6)
++#define BLE_PROFILE_CONSUMER_MAX_KEYS (1)
++
++// Report ids cant be 0
++enum HidReportId {
++    ReportIdKeyboard = 1,
++    ReportIdMouse = 2,
++    ReportIdConsumer = 3,
++};
++// Report numbers corresponded to the report id with an offset of 1
++enum HidInputNumber {
++    ReportNumberKeyboard = 0,
++    ReportNumberMouse = 1,
++    ReportNumberConsumer = 2,
++};
++
++typedef struct {
++    uint8_t mods;
++    uint8_t reserved;
++    uint8_t key[BLE_PROFILE_HID_KB_MAX_KEYS];
++} FURI_PACKED FuriHalBtHidKbReport;
++
++typedef struct {
++    uint8_t btn;
++    int8_t x;
++    int8_t y;
++    int8_t wheel;
++} FURI_PACKED FuriHalBtHidMouseReport;
++
++typedef struct {
++    uint16_t key[BLE_PROFILE_CONSUMER_MAX_KEYS];
++} FURI_PACKED FuriHalBtHidConsumerReport;
++
++// keyboard+mouse+consumer hid report
++static const uint8_t ble_profile_hid_report_map_data[] = {
++    // Keyboard Report
++    HID_USAGE_PAGE(HID_PAGE_DESKTOP),
++    HID_USAGE(HID_DESKTOP_KEYBOARD),
++    HID_COLLECTION(HID_APPLICATION_COLLECTION),
++    HID_REPORT_ID(ReportIdKeyboard),
++    HID_USAGE_PAGE(HID_DESKTOP_KEYPAD),
++    HID_USAGE_MINIMUM(HID_KEYBOARD_L_CTRL),
++    HID_USAGE_MAXIMUM(HID_KEYBOARD_R_GUI),
++    HID_LOGICAL_MINIMUM(0),
++    HID_LOGICAL_MAXIMUM(1),
++    HID_REPORT_SIZE(1),
++    HID_REPORT_COUNT(8),
++    HID_INPUT(HID_IOF_DATA | HID_IOF_VARIABLE | HID_IOF_ABSOLUTE),
++    HID_REPORT_COUNT(1),
++    HID_REPORT_SIZE(8),
++    HID_INPUT(HID_IOF_CONSTANT | HID_IOF_VARIABLE | HID_IOF_ABSOLUTE),
++    HID_USAGE_PAGE(HID_PAGE_LED),
++    HID_REPORT_COUNT(8),
++    HID_REPORT_SIZE(1),
++    HID_USAGE_MINIMUM(1),
++    HID_USAGE_MAXIMUM(8),
++    HID_OUTPUT(HID_IOF_DATA | HID_IOF_VARIABLE | HID_IOF_ABSOLUTE),
++    HID_REPORT_COUNT(BLE_PROFILE_HID_KB_MAX_KEYS),
++    HID_REPORT_SIZE(8),
++    HID_LOGICAL_MINIMUM(0),
++    HID_LOGICAL_MAXIMUM(101),
++    HID_USAGE_PAGE(HID_DESKTOP_KEYPAD),
++    HID_USAGE_MINIMUM(0),
++    HID_USAGE_MAXIMUM(101),
++    HID_INPUT(HID_IOF_DATA | HID_IOF_ARRAY | HID_IOF_ABSOLUTE),
++    HID_END_COLLECTION,
++    // Mouse Report
++    HID_USAGE_PAGE(HID_PAGE_DESKTOP),
++    HID_USAGE(HID_DESKTOP_MOUSE),
++    HID_COLLECTION(HID_APPLICATION_COLLECTION),
++    HID_USAGE(HID_DESKTOP_POINTER),
++    HID_COLLECTION(HID_PHYSICAL_COLLECTION),
++    HID_REPORT_ID(ReportIdMouse),
++    HID_USAGE_PAGE(HID_PAGE_BUTTON),
++    HID_USAGE_MINIMUM(1),
++    HID_USAGE_MAXIMUM(3),
++    HID_LOGICAL_MINIMUM(0),
++    HID_LOGICAL_MAXIMUM(1),
++    HID_REPORT_COUNT(3),
++    HID_REPORT_SIZE(1),
++    HID_INPUT(HID_IOF_DATA | HID_IOF_VARIABLE | HID_IOF_ABSOLUTE),
++    HID_REPORT_SIZE(1),
++    HID_REPORT_COUNT(5),
++    HID_INPUT(HID_IOF_CONSTANT | HID_IOF_VARIABLE | HID_IOF_ABSOLUTE),
++    HID_USAGE_PAGE(HID_PAGE_DESKTOP),
++    HID_USAGE(HID_DESKTOP_X),
++    HID_USAGE(HID_DESKTOP_Y),
++    HID_USAGE(HID_DESKTOP_WHEEL),
++    HID_LOGICAL_MINIMUM(-127),
++    HID_LOGICAL_MAXIMUM(127),
++    HID_REPORT_SIZE(8),
++    HID_REPORT_COUNT(3),
++    HID_INPUT(HID_IOF_DATA | HID_IOF_VARIABLE | HID_IOF_RELATIVE),
++    HID_END_COLLECTION,
++    HID_END_COLLECTION,
++    // Consumer Report
++    HID_USAGE_PAGE(HID_PAGE_CONSUMER),
++    HID_USAGE(HID_CONSUMER_CONTROL),
++    HID_COLLECTION(HID_APPLICATION_COLLECTION),
++    HID_REPORT_ID(ReportIdConsumer),
++    HID_LOGICAL_MINIMUM(0),
++    HID_RI_LOGICAL_MAXIMUM(16, 0x3FF),
++    HID_USAGE_MINIMUM(0),
++    HID_RI_USAGE_MAXIMUM(16, 0x3FF),
++    HID_REPORT_COUNT(BLE_PROFILE_CONSUMER_MAX_KEYS),
++    HID_REPORT_SIZE(16),
++    HID_INPUT(HID_IOF_DATA | HID_IOF_ARRAY | HID_IOF_ABSOLUTE),
++    HID_END_COLLECTION,
++};
++
++typedef struct {
++    FuriHalBleProfileBase base;
++
++    FuriHalBtHidKbReport* kb_report;
++    FuriHalBtHidMouseReport* mouse_report;
++    FuriHalBtHidConsumerReport* consumer_report;
++
++    BleServiceBattery* battery_svc;
++    BleServiceDevInfo* dev_info_svc;
++    BleServiceHid* hid_svc;
++} BleProfileHid;
++_Static_assert(offsetof(BleProfileHid, base) == 0, "Wrong layout");
++
++static FuriHalBleProfileBase* ble_profile_hid_start(FuriHalBleProfileParams profile_params) {
++    UNUSED(profile_params);
++
++    BleProfileHid* profile = malloc(sizeof(BleProfileHid));
++
++    profile->base.config = ble_profile_hid;
++
++    profile->battery_svc = ble_svc_battery_start(true);
++    profile->dev_info_svc = ble_svc_dev_info_start();
++    profile->hid_svc = ble_svc_hid_start();
++
++    // Configure HID Keyboard
++    profile->kb_report = malloc(sizeof(FuriHalBtHidKbReport));
++    profile->mouse_report = malloc(sizeof(FuriHalBtHidMouseReport));
++    profile->consumer_report = malloc(sizeof(FuriHalBtHidConsumerReport));
++
++    // Configure Report Map characteristic
++    ble_svc_hid_update_report_map(
++        profile->hid_svc,
++        ble_profile_hid_report_map_data,
++        sizeof(ble_profile_hid_report_map_data));
++    // Configure HID Information characteristic
++    uint8_t hid_info_val[4] = {
++        HID_INFO_BASE_USB_SPECIFICATION & 0x00ff,
++        (HID_INFO_BASE_USB_SPECIFICATION & 0xff00) >> 8,
++        HID_INFO_COUNTRY_CODE,
++        BLE_PROFILE_HID_INFO_FLAG_REMOTE_WAKE_MSK |
++            BLE_PROFILE_HID_INFO_FLAG_NORMALLY_CONNECTABLE_MSK,
++    };
++    ble_svc_hid_update_info(profile->hid_svc, hid_info_val);
++
++    return &profile->base;
++}
++
++static void ble_profile_hid_stop(FuriHalBleProfileBase* profile) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++    ble_svc_battery_stop(hid_profile->battery_svc);
++    ble_svc_dev_info_stop(hid_profile->dev_info_svc);
++    ble_svc_hid_stop(hid_profile->hid_svc);
++
++    free(hid_profile->kb_report);
++    free(hid_profile->mouse_report);
++    free(hid_profile->consumer_report);
++}
++
++bool ble_profile_hid_kb_press(FuriHalBleProfileBase* profile, uint16_t button) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++    FuriHalBtHidKbReport* kb_report = hid_profile->kb_report;
++    for(uint8_t i = 0; i < BLE_PROFILE_HID_KB_MAX_KEYS; i++) {
++        if(kb_report->key[i] == 0) {
++            kb_report->key[i] = button & 0xFF;
++            break;
++        }
++    }
++    kb_report->mods |= (button >> 8);
++    return ble_svc_hid_update_input_report(
++        hid_profile->hid_svc,
++        ReportNumberKeyboard,
++        (uint8_t*)kb_report,
++        sizeof(FuriHalBtHidKbReport));
++}
++
++bool ble_profile_hid_kb_release(FuriHalBleProfileBase* profile, uint16_t button) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++
++    FuriHalBtHidKbReport* kb_report = hid_profile->kb_report;
++    for(uint8_t i = 0; i < BLE_PROFILE_HID_KB_MAX_KEYS; i++) {
++        if(kb_report->key[i] == (button & 0xFF)) {
++            kb_report->key[i] = 0;
++            break;
++        }
++    }
++    kb_report->mods &= ~(button >> 8);
++    return ble_svc_hid_update_input_report(
++        hid_profile->hid_svc,
++        ReportNumberKeyboard,
++        (uint8_t*)kb_report,
++        sizeof(FuriHalBtHidKbReport));
++}
++
++bool ble_profile_hid_kb_release_all(FuriHalBleProfileBase* profile) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++    FuriHalBtHidKbReport* kb_report = hid_profile->kb_report;
++    for(uint8_t i = 0; i < BLE_PROFILE_HID_KB_MAX_KEYS; i++) {
++        kb_report->key[i] = 0;
++    }
++    kb_report->mods = 0;
++    return ble_svc_hid_update_input_report(
++        hid_profile->hid_svc,
++        ReportNumberKeyboard,
++        (uint8_t*)kb_report,
++        sizeof(FuriHalBtHidKbReport));
++}
++
++bool ble_profile_hid_consumer_key_press(FuriHalBleProfileBase* profile, uint16_t button) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++    FuriHalBtHidConsumerReport* consumer_report = hid_profile->consumer_report;
++    for(uint8_t i = 0; i < BLE_PROFILE_CONSUMER_MAX_KEYS; i++) { //-V1008
++        if(consumer_report->key[i] == 0) {
++            consumer_report->key[i] = button;
++            break;
++        }
++    }
++    return ble_svc_hid_update_input_report(
++        hid_profile->hid_svc,
++        ReportNumberConsumer,
++        (uint8_t*)consumer_report,
++        sizeof(FuriHalBtHidConsumerReport));
++}
++
++bool ble_profile_hid_consumer_key_release(FuriHalBleProfileBase* profile, uint16_t button) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++    FuriHalBtHidConsumerReport* consumer_report = hid_profile->consumer_report;
++    for(uint8_t i = 0; i < BLE_PROFILE_CONSUMER_MAX_KEYS; i++) { //-V1008
++        if(consumer_report->key[i] == button) {
++            consumer_report->key[i] = 0;
++            break;
++        }
++    }
++    return ble_svc_hid_update_input_report(
++        hid_profile->hid_svc,
++        ReportNumberConsumer,
++        (uint8_t*)consumer_report,
++        sizeof(FuriHalBtHidConsumerReport));
++}
++
++bool ble_profile_hid_consumer_key_release_all(FuriHalBleProfileBase* profile) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++    FuriHalBtHidConsumerReport* consumer_report = hid_profile->consumer_report;
++    for(uint8_t i = 0; i < BLE_PROFILE_CONSUMER_MAX_KEYS; i++) { //-V1008
++        consumer_report->key[i] = 0;
++    }
++    return ble_svc_hid_update_input_report(
++        hid_profile->hid_svc,
++        ReportNumberConsumer,
++        (uint8_t*)consumer_report,
++        sizeof(FuriHalBtHidConsumerReport));
++}
++
++bool ble_profile_hid_mouse_move(FuriHalBleProfileBase* profile, int8_t dx, int8_t dy) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++    FuriHalBtHidMouseReport* mouse_report = hid_profile->mouse_report;
++    mouse_report->x = dx;
++    mouse_report->y = dy;
++    bool state = ble_svc_hid_update_input_report(
++        hid_profile->hid_svc,
++        ReportNumberMouse,
++        (uint8_t*)mouse_report,
++        sizeof(FuriHalBtHidMouseReport));
++    mouse_report->x = 0;
++    mouse_report->y = 0;
++    return state;
++}
++
++bool ble_profile_hid_mouse_press(FuriHalBleProfileBase* profile, uint8_t button) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++    FuriHalBtHidMouseReport* mouse_report = hid_profile->mouse_report;
++    mouse_report->btn |= button;
++    return ble_svc_hid_update_input_report(
++        hid_profile->hid_svc,
++        ReportNumberMouse,
++        (uint8_t*)mouse_report,
++        sizeof(FuriHalBtHidMouseReport));
++}
++
++bool ble_profile_hid_mouse_release(FuriHalBleProfileBase* profile, uint8_t button) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++    FuriHalBtHidMouseReport* mouse_report = hid_profile->mouse_report;
++    mouse_report->btn &= ~button;
++    return ble_svc_hid_update_input_report(
++        hid_profile->hid_svc,
++        ReportNumberMouse,
++        (uint8_t*)mouse_report,
++        sizeof(FuriHalBtHidMouseReport));
++}
++
++bool ble_profile_hid_mouse_release_all(FuriHalBleProfileBase* profile) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++    FuriHalBtHidMouseReport* mouse_report = hid_profile->mouse_report;
++    mouse_report->btn = 0;
++    return ble_svc_hid_update_input_report(
++        hid_profile->hid_svc,
++        ReportNumberMouse,
++        (uint8_t*)mouse_report,
++        sizeof(FuriHalBtHidMouseReport));
++}
++
++bool ble_profile_hid_mouse_scroll(FuriHalBleProfileBase* profile, int8_t delta) {
++    furi_check(profile);
++    furi_check(profile->config == ble_profile_hid);
++
++    BleProfileHid* hid_profile = (BleProfileHid*)profile;
++    FuriHalBtHidMouseReport* mouse_report = hid_profile->mouse_report;
++    mouse_report->wheel = delta;
++    bool state = ble_svc_hid_update_input_report(
++        hid_profile->hid_svc,
++        ReportNumberMouse,
++        (uint8_t*)mouse_report,
++        sizeof(FuriHalBtHidMouseReport));
++    mouse_report->wheel = 0;
++    return state;
++}
++
++static GapConfig template_config = {
++    .adv_service = {
++      .UUID_Type = UUID_TYPE_16,  // oder UUID_TYPE_128 für 128-Bit-UUIDs
++      .Service_UUID_16 = HUMAN_INTERFACE_DEVICE_SERVICE_UUID,  // Falls 16-Bit
++},
++    .appearance_char = GAP_APPEARANCE_KEYBOARD,
++    .bonding_mode = true,
++    .pairing_method = GapPairingPinCodeVerifyYesNo,
++    .conn_param =
++        {
++            .conn_int_min = 0x18, // 30 ms
++            .conn_int_max = 0x24, // 45 ms
++            .slave_latency = 0,
++            .supervisor_timeout = 0,
++        },
++};
++
++static void ble_profile_hid_get_config(GapConfig* config, FuriHalBleProfileParams profile_params) {
++    BleProfileHidParams* hid_profile_params = profile_params;
++
++    furi_check(config);
++    memcpy(config, &template_config, sizeof(GapConfig));
++
++    // Set mac address
++    memcpy(config->mac_address, hid_profile_params->mac, sizeof(config->mac_address));
++
++    // Set advertise name
++    config->adv_name[0] = furi_hal_version_get_ble_local_device_name_ptr()[0];
++    strlcpy(config->adv_name + 1, hid_profile_params->name, sizeof(config->adv_name) - 1);
++
++    // Set bonding mode
++    config->bonding_mode = hid_profile_params->bonding;
++
++    // Set pairing method
++    config->pairing_method = hid_profile_params->pairing;
++}
++
++static const FuriHalBleProfileTemplate profile_callbacks = {
++    .start = ble_profile_hid_start,
++    .stop = ble_profile_hid_stop,
++    .get_gap_config = ble_profile_hid_get_config,
++};
++
++const FuriHalBleProfileTemplate* ble_profile_hid = &profile_callbacks;
+diff --git a/applications/system/hid_app/ble_hid.h b/applications/system/hid_app/ble_hid.h
+new file mode 100644
+index 0000000000..717625354e
+--- /dev/null
++++ b/applications/system/hid_app/ble_hid.h
+@@ -0,0 +1,107 @@
++#pragma once
++
++#include <furi_ble/profile_interface.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/** 
++ * Optional arguments to pass along with profile template as 
++ * FuriHalBleProfileParams for tuning profile behavior 
++ **/
++typedef struct {
++    char name[FURI_HAL_BT_ADV_NAME_LENGTH]; /**< Full device name  */
++    uint8_t mac[GAP_MAC_ADDR_SIZE]; /**< Full device address */
++    bool bonding; /**< Save paired devices */
++    GapPairing pairing; /**< Pairing security method */
++} BleProfileHidParams;
++
++/** Hid Keyboard Profile descriptor */
++extern const FuriHalBleProfileTemplate* ble_profile_hid;
++
++/** Press keyboard button
++ *
++ * @param profile   profile instance
++ * @param button    button code from HID specification
++ *
++ * @return          true on success
++ */
++bool ble_profile_hid_kb_press(FuriHalBleProfileBase* profile, uint16_t button);
++
++/** Release keyboard button
++ *
++ * @param profile   profile instance
++ * @param button    button code from HID specification
++ *
++ * @return          true on success
++ */
++bool ble_profile_hid_kb_release(FuriHalBleProfileBase* profile, uint16_t button);
++
++/** Release all keyboard buttons
++ *
++ * @param profile   profile instance
++ * @return          true on success
++ */
++bool ble_profile_hid_kb_release_all(FuriHalBleProfileBase* profile);
++
++/** Set the following consumer key to pressed state and send HID report
++ *
++ * @param profile   profile instance
++ * @param button    key code
++ */
++bool ble_profile_hid_consumer_key_press(FuriHalBleProfileBase* profile, uint16_t button);
++
++/** Set the following consumer key to released state and send HID report
++ *
++ * @param profile   profile instance
++ * @param button    key code
++ */
++bool ble_profile_hid_consumer_key_release(FuriHalBleProfileBase* profile, uint16_t button);
++
++/** Set consumer key to released state and send HID report
++ *
++ * @param profile   profile instance
++ * @param button    key code
++ */
++bool ble_profile_hid_consumer_key_release_all(FuriHalBleProfileBase* profile);
++
++/** Set mouse movement and send HID report
++ *
++ * @param profile    profile instance
++ * @param      dx    x coordinate delta
++ * @param      dy    y coordinate delta
++ */
++bool ble_profile_hid_mouse_move(FuriHalBleProfileBase* profile, int8_t dx, int8_t dy);
++
++/** Set mouse button to pressed state and send HID report
++ *
++ * @param profile   profile instance
++ * @param   button  key code
++ */
++bool ble_profile_hid_mouse_press(FuriHalBleProfileBase* profile, uint8_t button);
++
++/** Set mouse button to released state and send HID report
++ *
++ * @param profile   profile instance
++ * @param   button  key code
++ */
++bool ble_profile_hid_mouse_release(FuriHalBleProfileBase* profile, uint8_t button);
++
++/** Set mouse button to released state and send HID report
++ *
++ * @param profile   profile instance
++ * @param   button  key code
++ */
++bool ble_profile_hid_mouse_release_all(FuriHalBleProfileBase* profile);
++
++/** Set mouse wheel position and send HID report
++ *
++ * @param profile   profile instance
++ * @param    delta  number of scroll steps
++ */
++bool ble_profile_hid_mouse_scroll(FuriHalBleProfileBase* profile, int8_t delta);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/applications/system/hid_app/ble_hid_svc.c b/applications/system/hid_app/ble_hid_svc.c
+new file mode 100644
+index 0000000000..71270e1557
+--- /dev/null
++++ b/applications/system/hid_app/ble_hid_svc.c
+@@ -0,0 +1,320 @@
++#include "ble_hid_svc.h"
++#include "app_common.h"
++#include <ble/ble.h>
++#include <furi_ble/event_dispatcher.h>
++#include <furi_ble/gatt.h>
++
++#include <furi.h>
++#include <stdint.h>
++
++#define TAG "BleHid"
++
++#define BLE_SVC_HID_REPORT_MAP_MAX_LEN (255)
++#define BLE_SVC_HID_REPORT_MAX_LEN (255)
++#define BLE_SVC_HID_REPORT_REF_LEN (2)
++#define BLE_SVC_HID_INFO_LEN (4)
++#define BLE_SVC_HID_CONTROL_POINT_LEN (1)
++
++#define BLE_SVC_HID_INPUT_REPORT_COUNT (3)
++#define BLE_SVC_HID_OUTPUT_REPORT_COUNT (0)
++#define BLE_SVC_HID_FEATURE_REPORT_COUNT (0)
++#define BLE_SVC_HID_REPORT_COUNT                                        \
++    (BLE_SVC_HID_INPUT_REPORT_COUNT + BLE_SVC_HID_OUTPUT_REPORT_COUNT + \
++     BLE_SVC_HID_FEATURE_REPORT_COUNT)
++
++typedef enum {
++    HidSvcGattCharacteristicProtocolMode = 0,
++    HidSvcGattCharacteristicReportMap,
++    HidSvcGattCharacteristicInfo,
++    HidSvcGattCharacteristicCtrlPoint,
++    HidSvcGattCharacteristicCount,
++} HidSvcGattCharacteristicId;
++
++typedef struct {
++    uint8_t report_idx;
++    uint8_t report_type;
++} HidSvcReportId;
++
++static_assert(sizeof(HidSvcReportId) == sizeof(uint16_t), "HidSvcReportId must be 2 bytes");
++
++static const Service_UUID_t ble_svc_hid_uuid = {
++    .Service_UUID_16 = HUMAN_INTERFACE_DEVICE_SERVICE_UUID,
++};
++
++static bool ble_svc_hid_char_desc_data_callback(
++    const void* context,
++    const uint8_t** data,
++    uint16_t* data_len) {
++    const HidSvcReportId* report_id = context;
++    *data_len = sizeof(HidSvcReportId);
++    if(data) {
++        *data = (const uint8_t*)report_id;
++    }
++    return false;
++}
++
++typedef struct {
++    const void* data_ptr;
++    uint16_t data_len;
++} HidSvcDataWrapper;
++
++static bool ble_svc_hid_report_data_callback(
++    const void* context,
++    const uint8_t** data,
++    uint16_t* data_len) {
++    const HidSvcDataWrapper* report_data = context;
++    if(data) {
++        *data = report_data->data_ptr;
++        *data_len = report_data->data_len;
++    } else {
++        *data_len = BLE_SVC_HID_REPORT_MAP_MAX_LEN;
++    }
++    return false;
++}
++
++static const BleGattCharacteristicParams ble_svc_hid_chars[HidSvcGattCharacteristicCount] = {
++    [HidSvcGattCharacteristicProtocolMode] =
++        {.name = "Protocol Mode",
++         .data_prop_type = FlipperGattCharacteristicDataFixed,
++         .data.fixed.length = 1,
++         .uuid.Char_UUID_16 = PROTOCOL_MODE_CHAR_UUID,
++         .uuid_type = UUID_TYPE_16,
++         .char_properties = CHAR_PROP_READ | CHAR_PROP_WRITE_WITHOUT_RESP,
++         .security_permissions = ATTR_PERMISSION_NONE,
++         .gatt_evt_mask = GATT_NOTIFY_ATTRIBUTE_WRITE,
++         .is_variable = CHAR_VALUE_LEN_CONSTANT},
++    [HidSvcGattCharacteristicReportMap] =
++        {.name = "Report Map",
++         .data_prop_type = FlipperGattCharacteristicDataCallback,
++         .data.callback.fn = ble_svc_hid_report_data_callback,
++         .data.callback.context = NULL,
++         .uuid.Char_UUID_16 = REPORT_MAP_CHAR_UUID,
++         .uuid_type = UUID_TYPE_16,
++         .char_properties = CHAR_PROP_READ,
++         .security_permissions = ATTR_PERMISSION_NONE,
++         .gatt_evt_mask = GATT_DONT_NOTIFY_EVENTS,
++         .is_variable = CHAR_VALUE_LEN_VARIABLE},
++    [HidSvcGattCharacteristicInfo] =
++        {.name = "HID Information",
++         .data_prop_type = FlipperGattCharacteristicDataFixed,
++         .data.fixed.length = BLE_SVC_HID_INFO_LEN,
++         .data.fixed.ptr = NULL,
++         .uuid.Char_UUID_16 = HID_INFORMATION_CHAR_UUID,
++         .uuid_type = UUID_TYPE_16,
++         .char_properties = CHAR_PROP_READ,
++         .security_permissions = ATTR_PERMISSION_NONE,
++         .gatt_evt_mask = GATT_DONT_NOTIFY_EVENTS,
++         .is_variable = CHAR_VALUE_LEN_CONSTANT},
++    [HidSvcGattCharacteristicCtrlPoint] =
++        {.name = "HID Control Point",
++         .data_prop_type = FlipperGattCharacteristicDataFixed,
++         .data.fixed.length = BLE_SVC_HID_CONTROL_POINT_LEN,
++         .uuid.Char_UUID_16 = HID_CONTROL_POINT_CHAR_UUID,
++         .uuid_type = UUID_TYPE_16,
++         .char_properties = CHAR_PROP_WRITE_WITHOUT_RESP,
++         .security_permissions = ATTR_PERMISSION_NONE,
++         .gatt_evt_mask = GATT_NOTIFY_ATTRIBUTE_WRITE,
++         .is_variable = CHAR_VALUE_LEN_CONSTANT},
++};
++
++static const BleGattCharacteristicDescriptorParams ble_svc_hid_char_descr_template = {
++    .uuid_type = UUID_TYPE_16,
++    .uuid.Char_UUID_16 = REPORT_REFERENCE_DESCRIPTOR_UUID,
++    .max_length = BLE_SVC_HID_REPORT_REF_LEN,
++    .data_callback.fn = ble_svc_hid_char_desc_data_callback,
++    .security_permissions = ATTR_PERMISSION_NONE,
++    .access_permissions = ATTR_ACCESS_READ_WRITE,
++    .gatt_evt_mask = GATT_DONT_NOTIFY_EVENTS,
++    .is_variable = CHAR_VALUE_LEN_CONSTANT,
++};
++
++static const BleGattCharacteristicParams ble_svc_hid_report_template = {
++    .name = "Report",
++    .data_prop_type = FlipperGattCharacteristicDataCallback,
++    .data.callback.fn = ble_svc_hid_report_data_callback,
++    .data.callback.context = NULL,
++    .uuid.Char_UUID_16 = REPORT_CHAR_UUID,
++    .uuid_type = UUID_TYPE_16,
++    .char_properties = CHAR_PROP_READ | CHAR_PROP_NOTIFY,
++    .security_permissions = ATTR_PERMISSION_NONE,
++    .gatt_evt_mask = GATT_DONT_NOTIFY_EVENTS,
++    .is_variable = CHAR_VALUE_LEN_VARIABLE,
++};
++
++struct BleServiceHid {
++    uint16_t svc_handle;
++    BleGattCharacteristicInstance chars[HidSvcGattCharacteristicCount];
++    BleGattCharacteristicInstance input_report_chars[BLE_SVC_HID_INPUT_REPORT_COUNT];
++    BleGattCharacteristicInstance output_report_chars[BLE_SVC_HID_OUTPUT_REPORT_COUNT];
++    BleGattCharacteristicInstance feature_report_chars[BLE_SVC_HID_FEATURE_REPORT_COUNT];
++    GapSvcEventHandler* event_handler;
++};
++
++static BleEventAckStatus ble_svc_hid_event_handler(void* event, void* context) {
++    UNUSED(context);
++
++    BleEventAckStatus ret = BleEventNotAck;
++    hci_event_pckt* event_pckt = (hci_event_pckt*)(((hci_uart_pckt*)event)->data);
++    evt_blecore_aci* blecore_evt = (evt_blecore_aci*)event_pckt->data;
++    // aci_gatt_attribute_modified_event_rp0* attribute_modified;
++    if(event_pckt->evt == HCI_VENDOR_SPECIFIC_DEBUG_EVT_CODE) {
++        if(blecore_evt->ecode == ACI_GATT_ATTRIBUTE_MODIFIED_VSEVT_CODE) {
++            // Process modification events
++            ret = BleEventAckFlowEnable;
++        } else if(blecore_evt->ecode == ACI_GATT_SERVER_CONFIRMATION_VSEVT_CODE) {
++            // Process notification confirmation
++            ret = BleEventAckFlowEnable;
++        }
++    }
++    return ret;
++}
++
++BleServiceHid* ble_svc_hid_start() {
++    BleServiceHid* hid_svc = malloc(sizeof(BleServiceHid));
++
++    // Register event handler
++    hid_svc->event_handler =
++        ble_event_dispatcher_register_svc_handler(ble_svc_hid_event_handler, hid_svc);
++    /**
++     *  Add Human Interface Device Service
++     */
++    if(!ble_gatt_service_add(
++           UUID_TYPE_16,
++           &ble_svc_hid_uuid,
++           PRIMARY_SERVICE,
++           2 + /* protocol mode */
++               (4 * BLE_SVC_HID_INPUT_REPORT_COUNT) + (3 * BLE_SVC_HID_OUTPUT_REPORT_COUNT) +
++               (3 * BLE_SVC_HID_FEATURE_REPORT_COUNT) + 1 + 2 + 2 +
++               2, /* Service + Report Map + HID Information + HID Control Point */
++           &hid_svc->svc_handle)) {
++        free(hid_svc);
++        return NULL;
++    }
++
++    // Maintain previously defined characteristic order
++    ble_gatt_characteristic_init(
++        hid_svc->svc_handle,
++        &ble_svc_hid_chars[HidSvcGattCharacteristicProtocolMode],
++        &hid_svc->chars[HidSvcGattCharacteristicProtocolMode]);
++
++    uint8_t protocol_mode = 1;
++    ble_gatt_characteristic_update(
++        hid_svc->svc_handle,
++        &hid_svc->chars[HidSvcGattCharacteristicProtocolMode],
++        &protocol_mode);
++
++    // reports
++    BleGattCharacteristicDescriptorParams ble_svc_hid_char_descr;
++    BleGattCharacteristicParams report_char;
++    HidSvcReportId report_id;
++
++    memcpy(
++        &ble_svc_hid_char_descr, &ble_svc_hid_char_descr_template, sizeof(ble_svc_hid_char_descr));
++    memcpy(&report_char, &ble_svc_hid_report_template, sizeof(report_char));
++
++    ble_svc_hid_char_descr.data_callback.context = &report_id;
++    report_char.descriptor_params = &ble_svc_hid_char_descr;
++
++    typedef struct {
++        uint8_t report_type;
++        uint8_t report_count;
++        BleGattCharacteristicInstance* chars;
++    } HidSvcReportCharProps;
++
++    HidSvcReportCharProps hid_report_chars[] = {
++        {0x01, BLE_SVC_HID_INPUT_REPORT_COUNT, hid_svc->input_report_chars},
++        {0x02, BLE_SVC_HID_OUTPUT_REPORT_COUNT, hid_svc->output_report_chars},
++        {0x03, BLE_SVC_HID_FEATURE_REPORT_COUNT, hid_svc->feature_report_chars},
++    };
++
++    for(size_t report_type_idx = 0; report_type_idx < COUNT_OF(hid_report_chars);
++        report_type_idx++) {
++        report_id.report_type = hid_report_chars[report_type_idx].report_type;
++        for(size_t report_idx = 0; report_idx < hid_report_chars[report_type_idx].report_count;
++            report_idx++) {
++            report_id.report_idx = report_idx + 1;
++            ble_gatt_characteristic_init(
++                hid_svc->svc_handle,
++                &report_char,
++                &hid_report_chars[report_type_idx].chars[report_idx]);
++        }
++    }
++
++    // Setup remaining characteristics
++    for(size_t i = HidSvcGattCharacteristicReportMap; i < HidSvcGattCharacteristicCount; i++) {
++        ble_gatt_characteristic_init(
++            hid_svc->svc_handle, &ble_svc_hid_chars[i], &hid_svc->chars[i]);
++    }
++
++    return hid_svc;
++}
++
++bool ble_svc_hid_update_report_map(BleServiceHid* hid_svc, const uint8_t* data, uint16_t len) {
++    furi_assert(data);
++    furi_assert(hid_svc);
++
++    HidSvcDataWrapper report_data = {
++        .data_ptr = data,
++        .data_len = len,
++    };
++    return ble_gatt_characteristic_update(
++        hid_svc->svc_handle, &hid_svc->chars[HidSvcGattCharacteristicReportMap], &report_data);
++}
++
++bool ble_svc_hid_update_input_report(
++    BleServiceHid* hid_svc,
++    uint8_t input_report_num,
++    uint8_t* data,
++    uint16_t len) {
++    furi_assert(data);
++    furi_assert(hid_svc);
++    furi_assert(input_report_num < BLE_SVC_HID_INPUT_REPORT_COUNT);
++
++    HidSvcDataWrapper report_data = {
++        .data_ptr = data,
++        .data_len = len,
++    };
++    return ble_gatt_characteristic_update(
++        hid_svc->svc_handle, &hid_svc->input_report_chars[input_report_num], &report_data);
++}
++
++bool ble_svc_hid_update_info(BleServiceHid* hid_svc, uint8_t* data) {
++    furi_assert(data);
++    furi_assert(hid_svc);
++
++    return ble_gatt_characteristic_update(
++        hid_svc->svc_handle, &hid_svc->chars[HidSvcGattCharacteristicInfo], &data);
++}
++
++void ble_svc_hid_stop(BleServiceHid* hid_svc) {
++    furi_assert(hid_svc);
++    ble_event_dispatcher_unregister_svc_handler(hid_svc->event_handler);
++    // Delete characteristics
++    for(size_t i = 0; i < HidSvcGattCharacteristicCount; i++) {
++        ble_gatt_characteristic_delete(hid_svc->svc_handle, &hid_svc->chars[i]);
++    }
++
++    typedef struct {
++        uint8_t report_count;
++        BleGattCharacteristicInstance* chars;
++    } HidSvcReportCharProps;
++
++    HidSvcReportCharProps hid_report_chars[] = {
++        {BLE_SVC_HID_INPUT_REPORT_COUNT, hid_svc->input_report_chars},
++        {BLE_SVC_HID_OUTPUT_REPORT_COUNT, hid_svc->output_report_chars},
++        {BLE_SVC_HID_FEATURE_REPORT_COUNT, hid_svc->feature_report_chars},
++    };
++
++    for(size_t report_type_idx = 0; report_type_idx < COUNT_OF(hid_report_chars);
++        report_type_idx++) {
++        for(size_t report_idx = 0; report_idx < hid_report_chars[report_type_idx].report_count;
++            report_idx++) {
++            ble_gatt_characteristic_delete(
++                hid_svc->svc_handle, &hid_report_chars[report_type_idx].chars[report_idx]);
++        }
++    }
++
++    // Delete service
++    ble_gatt_service_delete(hid_svc->svc_handle);
++    free(hid_svc);
++}
+diff --git a/applications/system/hid_app/ble_hid_svc.h b/applications/system/hid_app/ble_hid_svc.h
+new file mode 100644
+index 0000000000..8e9cc29750
+--- /dev/null
++++ b/applications/system/hid_app/ble_hid_svc.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct BleServiceHid BleServiceHid;
++
++BleServiceHid* ble_svc_hid_start();
++
++void ble_svc_hid_stop(BleServiceHid* service);
++
++bool ble_svc_hid_update_report_map(BleServiceHid* service, const uint8_t* data, uint16_t len);
++
++bool ble_svc_hid_update_input_report(
++    BleServiceHid* service,
++    uint8_t input_report_num,
++    uint8_t* data,
++    uint16_t len);
++
++// Expects data to be of length BLE_SVC_HID_INFO_LEN (4 bytes)
++bool ble_svc_hid_update_info(BleServiceHid* service, uint8_t* data);
++
++#ifdef __cplusplus
++}
++#endif
+\ No newline at end of file
+diff --git a/applications/system/hid_app/hid.c b/applications/system/hid_app/hid.c
+index 91bf79188f..97648541b3 100644
+--- a/applications/system/hid_app/hid.c
++++ b/applications/system/hid_app/hid.c
+@@ -1,5 +1,5 @@
+ #include "hid.h"
+-#include <extra_profiles/hid_profile.h>
++#include "ble_hid.h"
+ #include <profiles/serial_profile.h>
+ #include "views.h"
+ #include <notification/notification_messages.h>
+@@ -258,7 +258,14 @@ int32_t hid_ble_app(void* p) {
+ 
+     furi_record_close(RECORD_STORAGE);
+ 
+-    app->ble_hid_profile = bt_profile_start(app->bt, ble_profile_hid, NULL);
++    BleProfileHidParams params = {
++        .bonding = true,
++        .pairing = GapPairingPinCodeVerifyYesNo,
++        .name = "Soundcore",
++        .mac = {0x12, 0x34, 0x56, 0x78, 0x90, 0x00},
++    };
++
++    app->ble_hid_profile = bt_profile_start(app->bt, ble_profile_hid, &params);
+ 
+     furi_check(app->ble_hid_profile);
+ 
+diff --git a/applications/system/hid_app/hid.h b/applications/system/hid_app/hid.h
+index 0024812a2b..05dbc7969c 100644
+--- a/applications/system/hid_app/hid.h
++++ b/applications/system/hid_app/hid.h
+@@ -5,7 +5,7 @@
+ #include <furi_hal_usb.h>
+ #include <furi_hal_usb_hid.h>
+ 
+-#include <extra_profiles/hid_profile.h>
++#include "ble_hid.h"
+ 
+ #include <bt/bt_service/bt.h>
+ #include <gui/gui.h>
+diff --git a/applications/system/hid_app/views/hid_media.c b/applications/system/hid_app/views/hid_media.c
+index e99065f74c..559b3e6648 100644
+--- a/applications/system/hid_app/views/hid_media.c
++++ b/applications/system/hid_app/views/hid_media.c
+@@ -1,7 +1,6 @@
+ #include "hid_media.h"
+ #include <furi.h>
+ #include <furi_hal_usb_hid.h>
+-#include <extra_profiles/hid_profile.h>
+ #include <gui/elements.h>
+ #include "../hid.h"
+ 
+diff --git a/applications/system/hid_app/views/hid_movie.c b/applications/system/hid_app/views/hid_movie.c
+index 2ee7b08388..55c37d6fa6 100644
+--- a/applications/system/hid_app/views/hid_movie.c
++++ b/applications/system/hid_app/views/hid_movie.c
+@@ -1,7 +1,6 @@
+ #include "hid_movie.h"
+ #include <furi.h>
+ #include <furi_hal_usb_hid.h>
+-#include <extra_profiles/hid_profile.h>
+ #include <gui/elements.h>
+ #include "../hid.h"
+ 
+diff --git a/applications/system/hid_app/views/hid_music_macos.c b/applications/system/hid_app/views/hid_music_macos.c
+index 1675b6dd52..ba60a8935b 100644
+--- a/applications/system/hid_app/views/hid_music_macos.c
++++ b/applications/system/hid_app/views/hid_music_macos.c
+@@ -1,7 +1,6 @@
+ #include "hid_music_macos.h"
+ #include <furi.h>
+ #include <furi_hal_usb_hid.h>
+-#include <extra_profiles/hid_profile.h>
+ #include <gui/elements.h>
+ #include "../hid.h"
+ 
