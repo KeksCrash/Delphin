@@ -10,6 +10,6 @@ for m in genai.list_models():
     print(m.name)
 
 # Example: Generate content
-model = genai.GenerativeModel('gemini-pro') # Or 'gemini-1.5-flash', 'gemini-1.5-pro', etc.
+model = genai.GenerativeModel('gemini-1.5-flash') # Or 'gemini-1.5-flash', 'gemini-1.5-pro', etc.
 response = model.generate_content("Tell me a fun fact about the universe.")
 print(response.text)
